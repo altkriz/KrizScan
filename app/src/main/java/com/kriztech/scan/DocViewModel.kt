@@ -1,0 +1,328 @@
+package com.kriztech.scan
+
+import android.app.Application
+import android.content.Context
+import android.graphics.Bitmap
+import android.net.Uri
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import com.kriztech.scan.data.AppSettings
+import com.kriztech.scan.data.DocRecord
+import com.kriztech.scan.data.HistoryStore
+import com.kriztech.scan.scan.BitmapUtil
+import com.kriztech.scan.scan.PdfImport
+import com.kriztech.scan.scan.Watermark
+import com.kriztech.scan.update.UpdateInfo
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicLong
+
+sealed class Screen {
+    object Tabs : Screen()
+    object Camera : Screen()
+    object Editor : Screen()
+}
+
+enum class Tab { Home, Documents, Settings }
+
+data class ScannedPage(
+    val id: Long,
+    val bitmap: Bitmap,
+    val filterId: String = "original",
+    val brightness: Float = 0f,
+    val contrast: Float = 1f,
+    val watermark: Watermark? = null
+)
+
+class DocViewModel(app: Application) : AndroidViewModel(app) {
+
+    private val context get() = getApplication<Application>()
+    private val store = HistoryStore(context)
+    private val idCounter = AtomicLong(System.currentTimeMillis())
+
+    companion object {
+        /**
+         * Longest edge kept for an imported page. High enough that a normal phone photo
+         * (up to ~12 MP) is stored at its original resolution, so nothing is lost by
+         * simply importing it; only absurdly large captures are trimmed, to stay safe
+         * on memory.
+         */
+        const val MAX_IMPORT_DIM = 4096
+    }
+
+    var tab by mutableStateOf(Tab.Home)
+        private set
+    var screen by mutableStateOf<Screen>(Screen.Tabs)
+        private set
+
+    val pages = mutableStateListOf<ScannedPage>()
+    var selectedPage by mutableIntStateOf(0)
+        private set
+
+    var settings by mutableStateOf(AppSettings.load(context))
+        private set
+
+    var docs by mutableStateOf<List<DocRecord>>(emptyList())
+        private set
+
+    /** When the camera is opened from the editor, returning lands back in the editor. */
+    var returnToEditor by mutableStateOf(false)
+        private set
+
+    /** Camera preference that lasts only while this app process is alive. */
+    var cameraPreferredForSession by mutableStateOf(false)
+        private set
+
+    /** The next captured camera page should open directly in the crop editor. */
+    var autoCropNextPage by mutableStateOf(false)
+        private set
+
+    /** Update-check state, driven by the UI (which owns the coroutine scope). */
+    var latestUpdate by mutableStateOf<UpdateInfo?>(null)
+        private set
+    var updateChecking by mutableStateOf(false)
+        private set
+    var updateChecked by mutableStateOf(false)
+        private set
+    var showUpdateDialog by mutableStateOf(false)
+        private set
+
+    /** Set after a *manual* check finds nothing, so Settings can confirm "you're up to date". */
+    var noUpdateFound by mutableStateOf(false)
+        private set
+
+    init {
+        docs = store.load()
+    }
+
+    fun selectTab(t: Tab) {
+        tab = t
+        screen = Screen.Tabs
+    }
+
+    fun openCamera(fromEditor: Boolean, autoCrop: Boolean = false) {
+        returnToEditor = fromEditor
+        autoCropNextPage = autoCrop
+        screen = Screen.Camera
+    }
+
+    fun updateCameraPreferredForSession(enabled: Boolean) {
+        cameraPreferredForSession = enabled
+    }
+
+    fun consumeAutoCropNextPage() {
+        autoCropNextPage = false
+    }
+
+    fun closeCamera() {
+        screen = if (returnToEditor) Screen.Editor else Screen.Tabs
+    }
+
+    fun addBitmap(raw: Bitmap) = addBitmaps(listOf(raw))
+
+    /** Adds several images at once (multi-select from the gallery). */
+    fun addBitmaps(bitmaps: List<Bitmap>) {
+        if (bitmaps.isEmpty()) return
+        for (raw in bitmaps) {
+            var b = BitmapUtil.fitMax(raw, MAX_IMPORT_DIM)
+            if (b !== raw) raw.recycle()
+            // Images are never cropped automatically - the user crops manually in the
+            // editor (or rotates), so nothing is lost on import.
+            pages.add(ScannedPage(idCounter.incrementAndGet(), b, settings.defaultFilter))
+        }
+        selectedPage = pages.size - 1
+        screen = Screen.Editor
+    }
+
+    /** Adds several bitmaps at once (e.g. pages of an imported PDF). */
+    fun addPdfPages(bitmaps: List<Bitmap>) {
+        if (bitmaps.isEmpty()) return
+        for (raw in bitmaps) {
+            var b = BitmapUtil.fitMax(raw, MAX_IMPORT_DIM)
+            if (b !== raw) raw.recycle()
+            pages.add(ScannedPage(idCounter.incrementAndGet(), b, settings.defaultFilter))
+        }
+        selectedPage = pages.size - 1
+        screen = Screen.Editor
+    }
+
+    fun replaceSelected(bmp: Bitmap) {
+        val i = selectedPage
+        if (i in pages.indices) {
+            val old = pages[i]
+            pages[i] = old.copy(bitmap = bmp)
+        }
+    }
+
+    fun selectPage(i: Int) {
+        if (i in pages.indices) selectedPage = i
+    }
+
+    /** Removes a page; removing the last page clears the document (the editor then returns home). */
+    fun removePage(i: Int) {
+        if (i !in pages.indices) return
+        pages.removeAt(i)
+        selectedPage = selectedPage.coerceAtMost(pages.size - 1).coerceAtLeast(0)
+    }
+
+    fun movePage(i: Int, dir: Int) {
+        val j = i + dir
+        if (i in pages.indices && j in pages.indices) {
+            val tmp = pages[i]
+            pages[i] = pages[j]
+            pages[j] = tmp
+            selectedPage = j
+        }
+    }
+
+    fun rotateSelected() {
+        val i = selectedPage
+        if (i in pages.indices) {
+            val p = pages[i]
+            pages[i] = p.copy(bitmap = BitmapUtil.rotate90(p.bitmap))
+        }
+    }
+
+    /** [all] = true applies the change to every page (batch mode), else just the selected page. */
+    fun setFilter(f: String, all: Boolean = false) {
+        if (all) {
+            for (i in pages.indices) pages[i] = pages[i].copy(filterId = f)
+        } else {
+            val i = selectedPage
+            if (i in pages.indices) pages[i] = pages[i].copy(filterId = f)
+        }
+    }
+
+    fun setBrightness(v: Float, all: Boolean = false) {
+        if (all) {
+            for (i in pages.indices) pages[i] = pages[i].copy(brightness = v)
+        } else {
+            val i = selectedPage
+            if (i in pages.indices) pages[i] = pages[i].copy(brightness = v)
+        }
+    }
+
+    fun setContrast(v: Float, all: Boolean = false) {
+        if (all) {
+            for (i in pages.indices) pages[i] = pages[i].copy(contrast = v)
+        } else {
+            val i = selectedPage
+            if (i in pages.indices) pages[i] = pages[i].copy(contrast = v)
+        }
+    }
+
+    fun resetAdjustments(all: Boolean = false) {
+        if (all) {
+            for (i in pages.indices) pages[i] = pages[i].copy(brightness = 0f, contrast = 1f)
+        } else {
+            val i = selectedPage
+            if (i in pages.indices) pages[i] = pages[i].copy(brightness = 0f, contrast = 1f)
+        }
+    }
+
+    fun setWatermark(w: Watermark?, all: Boolean = false) {
+        if (all) {
+            for (i in pages.indices) pages[i] = pages[i].copy(watermark = w)
+        } else {
+            val i = selectedPage
+            if (i in pages.indices) pages[i] = pages[i].copy(watermark = w)
+        }
+    }
+
+    fun importFromUris(context: Context, uris: List<Uri>, isPdf: Boolean = false) {
+        viewModelScope.launch {
+            if (isPdf) {
+                val pdfUri = uris.firstOrNull() ?: return@launch
+                val pdfPages = withContext(Dispatchers.IO) { PdfImport.renderAll(context, pdfUri) }
+                if (!pdfPages.isNullOrEmpty()) {
+                    addPdfPages(pdfPages)
+                }
+            } else {
+                val bitmaps = withContext(Dispatchers.IO) {
+                    uris.mapNotNull { BitmapUtil.loadFromUri(context, it, MAX_IMPORT_DIM) }
+                }
+                if (bitmaps.isNotEmpty()) {
+                    addBitmaps(bitmaps)
+                }
+            }
+        }
+    }
+
+    fun updateSettings(s: AppSettings) {
+        settings = s
+        s.save(context)
+    }
+
+    fun addHistory(
+        title: String,
+        pageCount: Int,
+        format: String,
+        pdfUri: Uri?,
+        jpgUris: List<Uri>,
+        searchText: String = ""
+    ) {
+        val rec = DocRecord(
+            idCounter.incrementAndGet(),
+            title,
+            System.currentTimeMillis(),
+            pageCount,
+            format,
+            pdfUri?.toString(),
+            jpgUris.map { it.toString() },
+            searchText
+        )
+        store.add(rec)
+        docs = store.load()
+    }
+
+    fun deleteDoc(id: Long) {
+        val rec = docs.firstOrNull { it.id == id }
+        store.delete(id)
+        docs = store.load()
+        if (rec != null) {
+            // Best-effort removal of the exported media.
+            val resolver = context.contentResolver
+            rec.pdfUri?.let { runCatching { resolver.delete(Uri.parse(it), null, null) } }
+            rec.jpgUris.forEach { runCatching { resolver.delete(Uri.parse(it), null, null) } }
+        }
+    }
+
+    fun refreshDocs() {
+        docs = store.load()
+    }
+
+    fun newDoc() {
+        pages.clear()
+        selectedPage = 0
+    }
+
+    fun beginUpdateCheck(manual: Boolean) {
+        updateChecking = true
+        if (manual) noUpdateFound = false
+    }
+
+    fun finishUpdateCheck(info: UpdateInfo?, manual: Boolean) {
+        updateChecking = false
+        updateChecked = true
+        latestUpdate = info
+        if (info != null) {
+            showUpdateDialog = true
+        } else if (manual) {
+            noUpdateFound = true
+        }
+    }
+
+    fun openUpdateDialog() {
+        if (latestUpdate != null) showUpdateDialog = true
+    }
+
+    fun dismissUpdateDialog() {
+        showUpdateDialog = false
+    }
+}

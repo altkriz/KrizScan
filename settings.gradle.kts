@@ -15,5 +15,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "DocuScan"
+rootProject.name = "KrizScan"
 include(":app")

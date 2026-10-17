@@ -8,29 +8,38 @@ val releaseStoreFile = providers.environmentVariable("RELEASE_STORE_FILE").orNul
 val hasReleaseKey = releaseStoreFile?.exists() == true
 
 android {
-    namespace = "com.docuscan.app"
-    compileSdk = 35
+    namespace = "com.kriztech.scan"
+    compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.docuscan.app"
+        applicationId = "com.kriztech.scan"
         minSdk = 26
-        targetSdk = 35
+        targetSdk = 36
         versionCode = (System.getenv("VERSION_CODE") ?: "1").toInt()
         versionName = System.getenv("VERSION_NAME") ?: "1.0.0"
     }
 
     signingConfigs {
+        create("debugConfig") {
+            storeFile = file("${rootDir}/debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
         if (hasReleaseKey) {
             create("release") {
                 storeFile = releaseStoreFile
-                storePassword = providers.environmentVariable("RELEASE_STORE_PASSWORD").orNull?.takeIf { it.isNotBlank() } ?: "DocuScanBuild2026"
-                keyAlias = providers.environmentVariable("RELEASE_KEY_ALIAS").orNull?.takeIf { it.isNotBlank() } ?: "docuscan"
-                keyPassword = providers.environmentVariable("RELEASE_KEY_PASSWORD").orNull?.takeIf { it.isNotBlank() } ?: "DocuScanBuild2026"
+                storePassword = providers.environmentVariable("RELEASE_STORE_PASSWORD").orNull?.takeIf { it.isNotBlank() } ?: "KrizScanBuild2026"
+                keyAlias = providers.environmentVariable("RELEASE_KEY_ALIAS").orNull?.takeIf { it.isNotBlank() } ?: "krizscan"
+                keyPassword = providers.environmentVariable("RELEASE_KEY_PASSWORD").orNull?.takeIf { it.isNotBlank() } ?: "KrizScanBuild2026"
             }
         }
     }
 
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("debugConfig")
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")

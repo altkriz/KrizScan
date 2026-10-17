@@ -1,0 +1,6 @@
+{
+  "name": "KrizScan",
+  "description": "Professional document scanner with automatic enhancement, perspective correction, office scanner filters, watermark overlay, and PDF export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
